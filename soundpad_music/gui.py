@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import os
 import queue
+import sys
+import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from . import log as logmod
+from .log import log
 from .player import DONE, DOWNLOADING, ERROR, PLAYING, Player, Settings, app_dir
 from .soundpad import Soundpad
 from .sources import Downloader
@@ -22,8 +26,9 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("Soundpad Music — музыка в микрофон")
-        root.geometry("640x480")
-        root.minsize(480, 360)
+        root.geometry("720x600")
+        root.minsize(520, 440)
+        root.report_callback_exception = self._on_tk_error
 
         self.settings_path = os.path.join(app_dir(), "settings.json")
         self.settings = Settings.load(self.settings_path)
@@ -36,6 +41,7 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(100, self._pump)
         root.after(300, self._check_soundpad)
+        log.info("Окно запущено")
         from . import ytdlp_loader
         ytdlp_loader.update_in_background(
             lambda msg: self.events.put(("status", {"text": msg})))
@@ -73,18 +79,30 @@ class App:
                    ).pack(side="right", padx=4)
 
         cols = ("status", "title")
-        self.tree = ttk.Treeview(self.root, columns=cols, show="headings", height=10)
+        self.tree = ttk.Treeview(self.root, columns=cols, show="headings", height=6)
         self.tree.heading("status", text="Статус")
         self.tree.heading("title", text="Трек")
         self.tree.column("status", width=110, stretch=False)
         self.tree.column("title", width=480)
-        self.tree.pack(fill="both", expand=True, padx=8, pady=4)
         self.tree.tag_configure("playing", foreground="#0a7d28")
         self.tree.tag_configure("error", foreground="#b00020")
         self.tree.tag_configure("done", foreground="#888888")
 
+        # Низ окна пакуем раньше списка, чтобы при нехватке места сжимался список,
+        # а не пропадала строка состояния с ошибками
+        bottom = ttk.Frame(self.root)
+        bottom.pack(side="bottom", fill="x", padx=8, pady=(0, 6))
+        self.sp_var = tk.StringVar(value="Soundpad: проверяю…")
+        self.sp_label = tk.Label(bottom, textvariable=self.sp_var, anchor="w")
+        self.sp_label.pack(fill="x")
+        self.status_var = tk.StringVar(value="Вставьте ссылку или название и нажмите «▶ В микрофон»")
+        self.status_label = tk.Label(bottom, textvariable=self.status_var, anchor="w",
+                                     justify="left", wraplength=680,
+                                     font=("Segoe UI", 10, "bold"))
+        self.status_label.pack(fill="x")
+
         opts = ttk.LabelFrame(self.root, text="Настройки")
-        opts.pack(fill="x", **pad)
+        opts.pack(side="bottom", fill="x", **pad)
         self.vars = {}
         for i, (key, label) in enumerate([
                 ("play_in_mic", "Играть в микрофон"),
@@ -105,10 +123,9 @@ class App:
                           lambda e: self._set_opt("cookies_browser", self.browser.get()))
         self.browser.pack(side="left", padx=6)
         ttk.Button(brow, text="Очистить кэш", command=self._clear_cache).pack(side="left", padx=6)
+        ttk.Button(brow, text="Открыть лог", command=self._open_log).pack(side="left")
 
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(self.root, textvariable=self.status_var, foreground="#555"
-                  ).pack(fill="x", padx=8, pady=(0, 6))
+        self.tree.pack(fill="both", expand=True, padx=8, pady=4)
 
     # --- действия -----------------------------------------------------------
     def _add(self) -> None:
@@ -134,34 +151,75 @@ class App:
         setattr(self.settings, key, value)
         self.settings.save(self.settings_path)
 
+    def _set_status(self, text: str, error: bool = False) -> None:
+        self.status_var.set(("⚠ " if error else "") + text)
+        self.status_label.configure(fg="#c62828" if error else "#1b5e20")
+
+    def _open_log(self) -> None:
+        p = logmod.path()
+        if not os.path.exists(p):
+            self._set_status("Лог пока пуст")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(p)  # type: ignore[attr-defined]
+            else:
+                self._set_status(p)
+        except OSError as e:
+            self._set_status(f"Не открыть лог: {e}", error=True)
+
+    def _on_tk_error(self, exc, val, tb) -> None:
+        log.error("Ошибка в окне", exc_info=(exc, val, tb))
+        messagebox.showerror("Soundpad Music",
+                             f"Ошибка: {exc.__name__}: {val}\n\nПодробности в логе:\n{logmod.path()}")
+
     def _clear_cache(self) -> None:
         n = self.player.dl.clear_cache()
-        self.status_var.set(f"Удалено файлов из кэша: {n}")
+        self._set_status(f"Удалено файлов из кэша: {n}")
 
     def _check_soundpad(self) -> None:
-        import threading
-
+        """Каждые 5 секунд проверяем связь с Soundpad и показываем её внизу окна."""
         def work():
-            ok = self.player.sp.is_alive()
-            if not ok:
-                self.events.put(("error", {"text": "Soundpad не найден — запустите его, "
-                                                   "иначе играть будет некуда."}))
+            try:
+                ok = self.player.sp.is_alive()
+            except Exception:
+                log.exception("Проверка Soundpad")
+                ok = False
+            self.events.put(("soundpad", {"ok": ok}))
         threading.Thread(target=work, daemon=True).start()
+        self.root.after(5000, self._check_soundpad)
 
     # --- события от плеера --------------------------------------------------
     def _pump(self) -> None:
+        try:
+            self._pump_once()
+        except Exception:
+            log.exception("Ошибка обработки событий")
+        finally:
+            self.root.after(100, self._pump)  # что бы ни случилось, окно продолжает жить
+
+    def _pump_once(self) -> None:
         refresh = False
         try:
             while True:
                 kind, data = self.events.get_nowait()
                 if kind in ("queue", "item_progress"):
                     refresh = True
+                elif kind == "soundpad":
+                    if data.get("ok"):
+                        self.sp_var.set("Soundpad: ✅ подключен")
+                        self.sp_label.configure(fg="#1b5e20")
+                    else:
+                        self.sp_var.set("Soundpad: ❌ не найден. Запустите Soundpad "
+                                        "(нужна полная версия, не демо)")
+                        self.sp_label.configure(fg="#c62828")
                 elif kind == "status":
-                    self.status_var.set(data.get("text", ""))
+                    self._set_status(data.get("text", ""))
                 elif kind == "error":
-                    self.status_var.set("⚠ " + data.get("text", "").splitlines()[0])
-                    if "\n" in data.get("text", ""):
-                        messagebox.showwarning("Soundpad Music", data["text"])
+                    text = data.get("text", "")
+                    self._set_status(text.splitlines()[0] if text else "Ошибка", error=True)
+                    if "\n" in text:
+                        messagebox.showwarning("Soundpad Music", text)
                 elif kind == "now_playing":
                     item = data.get("item")
                     self.now_var.set(f"▶ {item.title}" if item else "Ничего не играет")
@@ -179,7 +237,6 @@ class App:
             pass
         if refresh:
             self._refresh_tree()
-        self.root.after(100, self._pump)
 
     def _refresh_tree(self) -> None:
         items = self.player.snapshot()

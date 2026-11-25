@@ -180,6 +180,21 @@ class PlayerTest(unittest.TestCase):
         player.stop()
         self.assertTrue(wait_until(lambda: [i.status for i in player.snapshot()] == [DONE]))
 
+    def test_survives_unexpected_error(self):
+        player, t, events = self.make()
+        orig = t._handle
+        calls = {"n": 0}
+
+        def flaky(cmd):
+            if cmd.startswith("DoPlaySound") and calls["n"] == 0:
+                calls["n"] += 1
+                raise ValueError("boom")
+            return orig(cmd)
+        t._handle = flaky
+        player.enqueue([Track("a", "u1"), Track("b", "u2")])
+        self.assertTrue(wait_until(lambda: [i.status for i in player.snapshot()] == [ERROR, DONE]))
+        self.assertIn("boom", player.snapshot()[0].error)
+
     def test_add_uses_resolver(self):
         t = FakeSoundpadTransport()
         player = Player(Soundpad(t), FakeDownloader(), Settings(),
