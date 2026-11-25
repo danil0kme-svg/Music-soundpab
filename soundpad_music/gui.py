@@ -36,6 +36,9 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(100, self._pump)
         root.after(300, self._check_soundpad)
+        from . import ytdlp_loader
+        ytdlp_loader.update_in_background(
+            lambda msg: self.events.put(("status", {"text": msg})))
 
     # --- разметка -----------------------------------------------------------
     def _build(self) -> None:
