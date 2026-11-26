@@ -10,6 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
+from .log import log
 from .soundpad import Soundpad, SoundpadError
 from .sources import Downloader, SourceError, Track, resolve
 
@@ -116,6 +117,7 @@ class Player:
                 self._emit("error", text=str(e))
                 return
             except Exception as e:
+                log.exception("Ошибка при разборе %r", text)
                 self._emit("error", text=f"Ошибка: {e}")
                 return
             if not tracks:
@@ -174,6 +176,8 @@ class Player:
 
     # --- внутренности -------------------------------------------------------
     def _emit(self, kind: str, **data) -> None:
+        if kind in ("status", "error"):
+            (log.warning if kind == "error" else log.info)("%s: %s", kind, data.get("text"))
         try:
             self._on_event(kind, data)
         except Exception:
@@ -232,6 +236,8 @@ class Player:
             try:
                 path = fut.result()
             except Exception as e:
+                if not isinstance(e, SourceError):
+                    log.exception("Ошибка скачивания %r", item.title)
                 if not item.removed:
                     self._set(item, ERROR, str(e))
                     self._emit("error", text=f"{item.title}: {e}")
@@ -247,11 +253,17 @@ class Player:
             except SoundpadError as e:
                 self._set(item, ERROR, str(e))
                 self._emit("error", text=str(e))
+            except Exception as e:
+                # что угодно неожиданное — не даём потоку плеера умереть молча
+                log.exception("Ошибка при проигрывании %r", item.title)
+                self._set(item, ERROR, f"{type(e).__name__}: {e}")
+                self._emit("error", text=f"Ошибка при проигрывании: {type(e).__name__}: {e}")
             finally:
                 self._current = None
                 self._emit("now_playing", item=None)
 
     def _play(self, item: QueueItem, path: str) -> None:
+        log.info("Играю %r из %s", item.title, path)
         index = self.sp.add_sound(path)
         self.sp.play(index, speakers=self.settings.play_in_speakers,
                      mic=self.settings.play_in_mic)

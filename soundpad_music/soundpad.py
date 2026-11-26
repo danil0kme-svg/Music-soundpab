@@ -14,6 +14,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
+from .log import log
+
 PIPE_NAME = r"\\.\pipe\sp_remote_control"
 
 
@@ -24,6 +26,11 @@ class SoundpadError(RuntimeError):
 class SoundpadNotRunning(SoundpadError):
     def __init__(self, msg: str = "Soundpad не запущен (или недоступно удалённое управление)"):
         super().__init__(msg)
+
+
+class SoundpadTimeout(SoundpadError):
+    def __init__(self):
+        super().__init__("Soundpad не отвечает на команды. Перезапустите Soundpad")
 
 
 class Transport(Protocol):
@@ -44,7 +51,8 @@ class WindowsPipeTransport:
     _ERROR_PIPE_BUSY = 231
     _ERROR_MORE_DATA = 234
 
-    def __init__(self, pipe_name: str = PIPE_NAME, connect_timeout: float = 2.0):
+    def __init__(self, pipe_name: str = PIPE_NAME, connect_timeout: float = 2.0,
+                 reply_timeout: float = 3.0):
         if sys.platform != "win32":
             raise SoundpadError("Soundpad работает только в Windows")
         import ctypes
@@ -69,6 +77,10 @@ class WindowsPipeTransport:
         k32.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
                                  ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
         k32.ReadFile.restype = wintypes.BOOL
+        k32.PeekNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+                                      wintypes.LPVOID, ctypes.POINTER(wintypes.DWORD),
+                                      wintypes.LPVOID]
+        k32.PeekNamedPipe.restype = wintypes.BOOL
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
         k32.CloseHandle.restype = wintypes.BOOL
         self._k32 = k32
@@ -76,6 +88,7 @@ class WindowsPipeTransport:
 
         self._pipe_name = pipe_name
         self._timeout = connect_timeout
+        self._reply_timeout = reply_timeout
         self._handle = None
         self._lock = threading.Lock()
 
@@ -114,6 +127,17 @@ class WindowsPipeTransport:
         written = wt.DWORD(0)
         if not self._k32.WriteFile(self._handle, data, len(data), ct.byref(written), None):
             raise OSError(ct.get_last_error(), "WriteFile failed")
+        # Ждём ответ с таймаутом: голый ReadFile висел бы вечно, если Soundpad молчит
+        deadline = time.monotonic() + self._reply_timeout
+        while True:
+            avail = wt.DWORD(0)
+            if not self._k32.PeekNamedPipe(self._handle, None, 0, None, ct.byref(avail), None):
+                raise OSError(ct.get_last_error(), "PeekNamedPipe failed")
+            if avail.value:
+                break
+            if time.monotonic() > deadline:
+                raise SoundpadTimeout()
+            time.sleep(0.01)
         chunks = []
         buf = ct.create_string_buffer(65536)
         while True:
@@ -136,7 +160,12 @@ class WindowsPipeTransport:
                 try:
                     raw = self._roundtrip(data)
                     return raw.decode("utf-8", errors="replace").rstrip("\x00")
-                except OSError:
+                except SoundpadTimeout:
+                    # ответ мог прийти позже и сбить следующие команды — начинаем с чистого канала
+                    self._close_unlocked()
+                    raise
+                except OSError as e:
+                    log.warning("Канал Soundpad оборвался (%s), переподключаюсь", e)
                     # Soundpad перезапустили или канал оборвался — переподключаемся
                     self._close_unlocked()
                     if attempt:
@@ -181,8 +210,17 @@ class Soundpad:
             self._transport.close()
 
     # --- базовое ------------------------------------------------------------
+    _QUIET = ("GetPlayStatus", "GetPlaybackPosition", "GetPlaybackDuration")
+
     def _query(self, command: str) -> str:
-        return self.transport.send(command).strip()
+        try:
+            resp = self.transport.send(command).strip()
+        except SoundpadError as e:
+            log.warning("Soundpad: %s -> ошибка: %s", command, e)
+            raise
+        if not command.startswith(self._QUIET):
+            log.info("Soundpad: %s -> %s", command, resp[:200])
+        return resp
 
     def _do(self, command: str) -> None:
         resp = self._query(command)
